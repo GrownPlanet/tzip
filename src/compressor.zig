@@ -3,13 +3,14 @@ const expect = std.testing.expect;
 
 const shared = @import("shared.zig");
 const Code = shared.Code;
+const Mode = shared.Mode;
 const readFile = shared.readFile;
 
 pub fn compress(in_filename: []const u8, out_filename: []const u8, allocator: std.mem.Allocator) !void {
-    const file_contents = try readFile(in_filename, allocator);
-    defer allocator.free(file_contents);
+    const contents = try combine(in_filename, allocator);
+    defer contents.deinit();
 
-    var elements = try countBits(file_contents, allocator);
+    var elements = try countBits(contents.items, allocator);
     defer elements.deinit();
 
     var tree = try makeTree(&elements, allocator);
@@ -19,7 +20,7 @@ pub fn compress(in_filename: []const u8, out_filename: []const u8, allocator: st
     defer codes.deinit();
     std.log.info("generated codes", .{});
 
-    const encoded = try encodeFile(file_contents, codes, allocator);
+    const encoded = try encodeFile(contents.items, codes, allocator);
     defer encoded.list.deinit();
     std.log.info("encoded file", .{});
 
@@ -44,6 +45,61 @@ fn binarySearch(
         }
     }
     return lo;
+}
+
+// ===================== combine files =====================
+fn combine(in_filename: []const u8, allocator: std.mem.Allocator) !std.ArrayList(u8) {
+    var out_buffer = std.ArrayList(u8).init(allocator);
+    
+    const stat = try std.fs.cwd().statFile(in_filename);
+    switch (stat.kind) {
+        .directory => try combine_dir(in_filename, &out_buffer, allocator),
+        .file => try combine_file(in_filename, &out_buffer, allocator),
+        else => unreachable,
+    }
+
+    return out_buffer;
+}
+
+fn combine_dir(dirname: []const u8, out_buffer: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try out_buffer.append(@intFromEnum(Mode.Dir));
+
+    try writeArbitraryBuffer(u32, @intCast(dirname.len), out_buffer);
+    try out_buffer.appendSlice(dirname);
+
+    var dir = try std.fs.cwd().openDir(dirname, .{ .iterate = true });
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        const new_path = try std.fs.path.join(allocator, &[_][]const u8{ dirname, entry.name });
+        defer allocator.free(new_path);
+        if (entry.kind == .directory) {
+            try combine_dir(new_path, out_buffer, allocator);
+        } else if (entry.kind == .file) {
+            try combine_file(new_path, out_buffer, allocator);
+        }
+    }
+}
+
+fn combine_file(filename: []const u8, out_buffer: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const file = try std.fs.cwd().openFile(filename, .{});
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const file_buffer = try allocator.alloc(u8, file_size);
+    defer allocator.free(file_buffer);
+
+    const read = try file.readAll(file_buffer);
+    if (read != file_size) return error.UnexpectedEof;
+
+    try out_buffer.append(@intFromEnum(Mode.File));
+
+    try writeArbitraryBuffer(u32, @intCast(filename.len), out_buffer);
+    try out_buffer.appendSlice(filename);
+
+    try writeArbitraryBuffer(u32, @intCast(file_size), out_buffer);
+    try out_buffer.appendSlice(file_buffer);
 }
 
 // ===================== node =====================
@@ -223,22 +279,28 @@ fn writeToFile(filename: []const u8, codes: std.AutoHashMap(u8, Code), encoded_f
     try file.writeAll(&[_]u8{ @as(u8, encoded_file.end_rem) });
 
     // metadata: number of chars
-    try writeArbitrary(usize, codes.count(), file);
+    try writeArbitraryFile(usize, codes.count(), file);
 
     // metadata: chars
     var iter = codes.iterator();
     while (iter.next()) |code| {
         try file.writeAll(&[_]u8{ code.key_ptr.* });
         try file.writeAll(&[_]u8{ @as(u8, code.value_ptr.*.len) });
-        try writeArbitrary(u32, code.value_ptr.*.bits, file);
+        try writeArbitraryFile(u32, code.value_ptr.*.bits, file);
     }
 
     // file
     try file.writeAll(encoded_file.list.items);
 }
 
-fn writeArbitrary(comptime T: type, num: T, file: std.fs.File) !void {
+fn writeArbitraryFile(comptime T: type, num: T, file: std.fs.File) !void {
     var buffer: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &buffer, num, .little);
     try file.writeAll(&buffer);
+}
+
+fn writeArbitraryBuffer(comptime T: type, num: T, out_buffer: *std.ArrayList(u8)) !void {
+    var buffer: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &buffer, num, .little);
+    try out_buffer.appendSlice(&buffer);
 }

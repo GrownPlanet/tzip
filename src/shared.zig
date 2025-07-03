@@ -5,6 +5,8 @@ pub const Code = struct {
     len: u5,
 };
 
+pub const Mode = enum(u8) { File, Dir };
+
 pub fn readFile(filename: []const u8, allocator: std.mem.Allocator) ![]u8 {
     const file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
